@@ -875,6 +875,31 @@ elif menu == "작업 상태 변경":
                     st.success(f"작업이 '{next_status}' 단계로 진행되었습니다.")
                     st.rerun()
 
+        # 편집 및 삭제 UI (워크플로우)
+        with st.expander('작업 수정/삭제'):
+            sel = df[df['작업ID'] == selected_id].iloc[0]
+
+            new_company = st.text_input('업체명', value=sel['업체명'])
+            new_spec = st.text_input('제품 규격', value=sel['제품규격'])
+            new_qty = st.number_input('수량', min_value=1, value=int(sel['수량']))
+            new_unit = st.selectbox('단위', ['장', '롤', 'kg', 'm'], index=['장','롤','kg','m'].index(sel['단위']) if sel['단위'] in ['장','롤','kg','m'] else 0)
+            new_manager = st.text_input('담당자', value=sel['담당자'])
+            new_priority = st.selectbox('우선순위', PRIORITY_OPTIONS, index=PRIORITY_OPTIONS.index(sel['우선순위']) if sel['우선순위'] in PRIORITY_OPTIONS else 2)
+            new_due = st.date_input('납기일', value=datetime.strptime(sel['납기일'], "%Y-%m-%d").date() if sel['납기일'] else date.today())
+            new_memo = st.text_area('메모', value=sel['메모'])
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button('저장(작업 변경)'):
+                    update_workflow_item(selected_id, 업체명=new_company, 제품규격=new_spec, 수량=new_qty, 단위=new_unit, 담당자=new_manager, 우선순위=new_priority, 납기일=new_due.strftime("%Y-%m-%d"), 메모=new_memo)
+                    st.success(f"[{selected_id}] 작업이 업데이트되었습니다.")
+                    st.rerun()
+            with col_b:
+                if st.button('삭제(작업 삭제)'):
+                    delete_workflow_item(selected_id)
+                    st.success(f"[{selected_id}] 작업이 삭제되었습니다.")
+                    st.rerun()
+
 elif menu == "완료된 작업 보기":
     st.subheader("✅ 완료된 작업 목록")
     

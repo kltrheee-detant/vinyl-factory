@@ -60,3 +60,14 @@ def test_update_workflow_item(tmp_path):
 
     assert loaded.loc[0, '업체명'] == 'NewClient'
     assert int(loaded.loc[0, '수량']) == 3
+
+
+def test_delete_workflow_item(tmp_path):
+    setup_tmp_db(tmp_path)
+
+    df = pd.DataFrame([{ '작업ID': 'W-DEL', '업체명': 'ToDelete', '제품규격': 's', '수량': 1, '단위': '장', '담당자': 'lee', '상태': '접수', '우선순위': '보통', '납기일': '2026-01-10', '메모': '', '등록일': '2026-01-05 00:00' }])
+    app.save_workflow(df)
+
+    app.delete_workflow_item('W-DEL')
+    loaded = app.load_workflow()
+    assert loaded.empty
