@@ -1,0 +1,10 @@
+.venv/
+inventory.db
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+.env
+.vscode/
+*.swp
