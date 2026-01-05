@@ -61,6 +61,31 @@ def init_db():
     conn.commit()
     conn.close()
 
+    # 추가 테이블: 거래 기록(transactions)과 재주문 임계값(reorder_levels)
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_type TEXT,
+            item_id TEXT,
+            delta REAL,
+            note TEXT,
+            timestamp TEXT
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS reorder_levels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_type TEXT,
+            item_id TEXT UNIQUE,
+            threshold REAL
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
 def load_roll_inventory():
     """롤 재고 데이터 로드"""
     conn = sqlite3.connect(DB_PATH)
@@ -79,12 +104,106 @@ def load_roll_inventory():
     })
     return df[['제품ID', '두께(mm)', '폭(cm)', '롤 길이(m)', '현재고(롤)', '최근업데이트']]
 
+
+def record_roll_transaction(item_id, delta, note=""):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO transactions (item_type, item_id, delta, note, timestamp) VALUES (?, ?, ?, ?, ?)",
+        ('roll', item_id, delta, note, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_monthly_usage_roll(item_id, year=None, month=None):
+    """주어진 연/월의 사용량(출고)을 합산해서 반환. 기본은 현재 달."""
+    if year is None or month is None:
+        now = datetime.now()
+        year = now.year
+        month = now.month
+
+    start = datetime(year, month, 1)
+    if month == 12:
+        end = datetime(year + 1, 1, 1)
+    else:
+        end = datetime(year, month + 1, 1)
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT SUM(-delta) FROM transactions WHERE item_type = ? AND item_id = ? AND delta < 0 AND timestamp >= ? AND timestamp < ?",
+        ('roll', item_id, start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S"))
+    )
+    res = cursor.fetchone()[0]
+    conn.close()
+    return float(res) if res is not None else 0.0
+
+
+def record_cut_transaction(item_id, delta, note=""):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO transactions (item_type, item_id, delta, note, timestamp) VALUES (?, ?, ?, ?, ?)",
+        ('cut', item_id, delta, note, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_monthly_usage_cut(item_id, year=None, month=None):
+    if year is None or month is None:
+        now = datetime.now()
+        year = now.year
+        month = now.month
+
+    start = datetime(year, month, 1)
+    if month == 12:
+        end = datetime(year + 1, 1, 1)
+    else:
+        end = datetime(year, month + 1, 1)
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT SUM(-delta) FROM transactions WHERE item_type = ? AND item_id = ? AND delta < 0 AND timestamp >= ? AND timestamp < ?",
+        ('cut', item_id, start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S"))
+    )
+    res = cursor.fetchone()[0]
+    conn.close()
+    return float(res) if res is not None else 0.0
+
+
+def set_reorder_level(item_type, item_id, threshold):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO reorder_levels (item_type, item_id, threshold)
+        VALUES (?, ?, ?)
+    ''', (item_type, item_id, threshold))
+    conn.commit()
+    conn.close()
+
+
+def get_reorder_level(item_type, item_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT threshold FROM reorder_levels WHERE item_type = ? AND item_id = ?', (item_type, item_id))
+    row = cursor.fetchone()
+    conn.close()
+    return float(row[0]) if row is not None else None
+
 def save_roll_inventory(df):
     """롤 재고 데이터 저장"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     for _, row in df.iterrows():
+        # 재고는 음수일 수 없음
+        if float(row['현재고(롤)']) < 0:
+            conn.close()
+            raise ValueError("현재고(롤)은 음수일 수 없습니다")
+
         cursor.execute('''
             INSERT OR REPLACE INTO roll_inventory (제품ID, 두께_mm, 폭_cm, 롤길이_m, 현재고_롤, 최근업데이트)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -116,6 +235,11 @@ def save_cut_inventory(df):
     cursor = conn.cursor()
     
     for _, row in df.iterrows():
+        # 재고는 음수일 수 없음
+        if float(row['현재고(장)']) < 0:
+            conn.close()
+            raise ValueError("현재고(장)은 음수일 수 없습니다")
+
         cursor.execute('''
             INSERT OR REPLACE INTO cut_inventory (재단ID, 업체명, 가로_cm, 세로_cm, 두께_mm, 현재고_장, 최근업데이트)
             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -168,7 +292,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # 제목
-st.title("🏭 비닐 제조 공장 재고 현황판")
+st.title("🏭 유한화학 재고 현황판")
 st.caption(f"💾 데이터베이스 연동됨: {DB_PATH}")
 st.markdown("---")
 
@@ -222,6 +346,8 @@ if menu == "롤 재고 현황 보기":
     st.subheader("📊 현재 롤 재고 목록")
     
     df = get_roll_inventory()
+    # 이번 달 사용량 컬럼 추가
+    df['이번달 사용량'] = df['제품ID'].apply(lambda pid: get_monthly_usage_roll(pid))
     
     if df.empty:
         st.info("등록된 롤 재고가 없습니다. '신규 롤 규격 등록'에서 추가해주세요.")
@@ -239,6 +365,26 @@ if menu == "롤 재고 현황 보기":
         
         total_rolls = df['현재고(롤)'].sum()
         st.info(f"📋 총 보유 롤 수량: {int(total_rolls)} 롤")
+
+        # 재주문 임계값 알림
+        alerts = []
+        for _, row in df.iterrows():
+            thr = get_reorder_level('roll', row['제품ID'])
+            if thr is not None and float(row['현재고(롤)']) <= thr:
+                alerts.append(f"재주문 필요: [{row['제품ID']}] 현재 {int(row['현재고(롤)'])} ≤ 임계값 {int(thr)}")
+
+        if alerts:
+            for a in alerts:
+                st.warning(a)
+
+        # 임계값 설정 UI (간단히 제품 선택 후 설정)
+        with st.expander('재주문 임계값 설정'):
+            prod = st.selectbox('제품 선택', df['제품ID'].tolist())
+            current_thr = get_reorder_level('roll', prod)
+            new_thr = st.number_input('임계값 (롤)', min_value=0, value=int(current_thr) if current_thr is not None else 0)
+            if st.button('임계값 저장'):
+                set_reorder_level('roll', prod, new_thr)
+                st.success(f'[{prod}] 임계값이 {int(new_thr)}롤로 설정되었습니다.')
 
 elif menu == "롤 입/출고 입력":
     st.subheader("📝 롤 생산 및 사용 등록")
@@ -268,6 +414,8 @@ elif menu == "롤 입/출고 입력":
             if input_type == "생산 (입고 +)":
                 df.loc[idx, '현재고(롤)'] = current_qty + qty
                 df.loc[idx, '최근업데이트'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                # 거래 기록
+                record_roll_transaction(selected_id, qty, note='입고')
                 save_roll_inventory(df)
                 st.success(f"{qty}롤 생산 등록 완료! (현재: {current_qty + qty}롤)")
             else:
@@ -276,6 +424,8 @@ elif menu == "롤 입/출고 입력":
                 else:
                     df.loc[idx, '현재고(롤)'] = current_qty - qty
                     df.loc[idx, '최근업데이트'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    # 거래 기록 (출고는 음수)
+                    record_roll_transaction(selected_id, -qty, note='출고')
                     save_roll_inventory(df)
                     st.success(f"{qty}롤 사용 등록 완료! (현재: {current_qty - qty}롤)")
 
@@ -319,6 +469,12 @@ elif menu == "재단 재고 현황 보기":
     st.subheader("✂️ 현재 재단 재고 목록")
     
     df = get_cut_inventory()
+    # 이번 달 사용량 컬럼 추가
+    def get_cut_usage_wrapper(cid):
+        # reuse roll function but for cuts we will implement below
+        return get_monthly_usage_cut(cid)
+
+    df['이번달 사용량'] = df['재단ID'].apply(lambda pid: get_monthly_usage_cut(pid))
     
     if df.empty:
         st.info("등록된 재단 규격이 없습니다.")
@@ -336,6 +492,25 @@ elif menu == "재단 재고 현황 보기":
         
         total_sheets = df['현재고(장)'].sum()
         st.info(f"📋 총 보유 재단 수량: {int(total_sheets)} 장")
+
+        # 재주문 임계값 알림
+        alerts = []
+        for _, row in df.iterrows():
+            thr = get_reorder_level('cut', row['재단ID'])
+            if thr is not None and float(row['현재고(장)']) <= thr:
+                alerts.append(f"재주문 필요: [{row['재단ID']}] 현재 {int(row['현재고(장)'])} ≤ 임계값 {int(thr)}")
+
+        if alerts:
+            for a in alerts:
+                st.warning(a)
+
+        with st.expander('재주문 임계값 설정 (재단)'):
+            prod = st.selectbox('재단 선택', df['재단ID'].tolist())
+            current_thr = get_reorder_level('cut', prod)
+            new_thr = st.number_input('임계값 (장)', min_value=0, value=int(current_thr) if current_thr is not None else 0, key='cut_thr')
+            if st.button('임계값 저장(재단)'):
+                set_reorder_level('cut', prod, new_thr)
+                st.success(f'[{prod}] 임계값이 {int(new_thr)}장으로 설정되었습니다.')
 
 elif menu == "재단 입/출고 입력":
     st.subheader("✂️ 재단 입고 및 출고 등록")
@@ -368,6 +543,8 @@ elif menu == "재단 입/출고 입력":
             if input_type == "재단 완료 (입고 +)":
                 df.loc[idx, '현재고(장)'] = current_qty + qty
                 df.loc[idx, '최근업데이트'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                # 거래 기록
+                record_cut_transaction(selected_id, qty, note='입고')
                 save_cut_inventory(df)
                 st.success(f"{qty}장 재단 입고 완료! (현재: {current_qty + qty}장)")
             else:
@@ -376,6 +553,8 @@ elif menu == "재단 입/출고 입력":
                 else:
                     df.loc[idx, '현재고(장)'] = current_qty - qty
                     df.loc[idx, '최근업데이트'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    # 거래 기록 (출고 음수)
+                    record_cut_transaction(selected_id, -qty, note='출고')
                     save_cut_inventory(df)
                     st.success(f"{qty}장 출고 완료! (현재: {current_qty - qty}장)")
 
@@ -591,4 +770,4 @@ elif menu == "완료된 작업 보기":
 
 # 하단 푸터
 st.markdown("---")
-st.markdown("© 2026 양주미래연 회장 비닐 제조 공장 재고 시스템")
+st.markdown("© 2026 유한화학 재고 시스템")
