@@ -212,6 +212,32 @@ def save_roll_inventory(df):
     conn.commit()
     conn.close()
 
+
+def update_roll_item(product_id, **kwargs):
+    df = load_roll_inventory()
+    if product_id not in df['제품ID'].values:
+        raise KeyError(f"제품ID {product_id} 없음")
+    idx = df[df['제품ID'] == product_id].index[0]
+    for k, v in kwargs.items():
+        if k == '두께_mm' or k == '두께(mm)':
+            df.loc[idx, '두께(mm)'] = v
+        elif k == '폭_cm' or k == '폭(cm)':
+            df.loc[idx, '폭(cm)'] = v
+        elif k == '롤길이_m' or k == '롤 길이(m)':
+            df.loc[idx, '롤 길이(m)'] = v
+        elif k == '현재고_롤' or k == '현재고(롤)':
+            df.loc[idx, '현재고(롤)'] = v
+    df.loc[idx, '최근업데이트'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    save_roll_inventory(df)
+
+
+def delete_roll_item(product_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM roll_inventory WHERE 제품ID = ?', (product_id,))
+    conn.commit()
+    conn.close()
+
 def load_cut_inventory():
     """재단 재고 데이터 로드"""
     conn = sqlite3.connect(DB_PATH)
@@ -248,6 +274,37 @@ def save_cut_inventory(df):
     conn.commit()
     conn.close()
 
+
+def update_cut_item(item_id, **kwargs):
+    df = load_cut_inventory()
+    if item_id not in df['재단ID'].values:
+        raise KeyError(f"재단ID {item_id} 없음")
+    idx = df[df['재단ID'] == item_id].index[0]
+    for k, v in kwargs.items():
+        # kwargs use DB column names (업체명, 가로_cm etc)
+        if k in ['업체명', '가로_cm', '세로_cm', '두께_mm', '현재고_장']:
+            # map to display columns if necessary
+            if k == '업체명':
+                df.loc[idx, '업체명'] = v
+            elif k == '가로_cm':
+                df.loc[idx, '가로(cm)'] = v
+            elif k == '세로_cm':
+                df.loc[idx, '세로(cm)'] = v
+            elif k == '두께_mm':
+                df.loc[idx, '두께(mm)'] = v
+            elif k == '현재고_장':
+                df.loc[idx, '현재고(장)'] = v
+    df.loc[idx, '최근업데이트'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    save_cut_inventory(df)
+
+
+def delete_cut_item(item_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM cut_inventory WHERE 재단ID = ?', (item_id,))
+    conn.commit()
+    conn.close()
+
 def load_workflow():
     """작업 플로우 데이터 로드"""
     conn = sqlite3.connect(DB_PATH)
@@ -276,6 +333,23 @@ def save_workflow(df):
     
     conn.commit()
     conn.close()
+
+
+def update_workflow_item(work_id, **kwargs):
+    df = load_workflow()
+    if work_id not in df['작업ID'].values:
+        raise KeyError(f"작업ID {work_id} 없음")
+    idx = df[df['작업ID'] == work_id].index[0]
+    for k, v in kwargs.items():
+        if k in df.columns:
+            df.loc[idx, k] = v
+    save_workflow(df)
+
+
+def delete_workflow_item(work_id):
+    df = load_workflow()
+    df = df[df['작업ID'] != work_id]
+    save_workflow(df)
 
 # 데이터베이스 초기화
 init_db()
@@ -352,8 +426,18 @@ if menu == "롤 재고 현황 보기":
     if df.empty:
         st.info("등록된 롤 재고가 없습니다. '신규 롤 규격 등록'에서 추가해주세요.")
     else:
+        # 정렬 컨트롤
+        sort_cols = ['제품ID', '두께(mm)', '폭(cm)', '롤 길이(m)', '현재고(롤)', '이번달 사용량']
+        sort_col = st.selectbox('정렬 기준', sort_cols, index=0)
+        sort_order = st.radio('정렬 순서', ['오름차순', '내림차순'], horizontal=True)
+        ascending = True if sort_order == '오름차순' else False
+        if sort_col in df.columns:
+            disp_df = df.sort_values(by=sort_col, ascending=ascending)
+        else:
+            disp_df = df
+
         st.dataframe(
-            df.style.format({
+            disp_df.style.format({
                 "두께(mm)": "{:.3f}",
                 "폭(cm)": "{:.1f}",
                 "롤 길이(m)": "{:.1f}",
@@ -365,6 +449,26 @@ if menu == "롤 재고 현황 보기":
         
         total_rolls = df['현재고(롤)'].sum()
         st.info(f"📋 총 보유 롤 수량: {int(total_rolls)} 롤")
+
+        # 편집 및 삭제 UI
+        with st.expander('제품 수정/삭제'):
+            edit_prod = st.selectbox('편집할 제품 선택', df['제품ID'].tolist())
+            idx = df[df['제품ID'] == edit_prod].index[0]
+
+            new_thickness = st.number_input('두께 (mm)', value=float(df.loc[idx, '두께(mm)']), format="%.3f")
+            new_width = st.number_input('폭 (cm)', value=float(df.loc[idx, '폭(cm)']), format="%.1f")
+            new_length = st.number_input('롤 길이 (m)', value=float(df.loc[idx, '롤 길이(m)']), format="%.1f")
+            new_stock = st.number_input('현재고 (롤)', min_value=0, value=int(df.loc[idx, '현재고(롤)']), step=1)
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button('저장'):
+                    update_roll_item(edit_prod, 두께_mm=new_thickness, 폭_cm=new_width, 롤길이_m=new_length, 현재고_롤=new_stock)
+                    st.success(f"[{edit_prod}]가 업데이트되었습니다.")
+            with col_b:
+                if st.button('삭제'):
+                    delete_roll_item(edit_prod)
+                    st.success(f"[{edit_prod}]가 삭제되었습니다.")
 
         # 재주문 임계값 알림
         alerts = []
@@ -479,8 +583,18 @@ elif menu == "재단 재고 현황 보기":
     if df.empty:
         st.info("등록된 재단 규격이 없습니다.")
     else:
+        # 정렬 컨트롤 (재단)
+        sort_cols = ['재단ID', '업체명', '가로(cm)', '세로(cm)', '두께(mm)', '현재고(장)', '이번달 사용량']
+        sort_col = st.selectbox('정렬 기준', sort_cols, index=0, key='cut_sort_col')
+        sort_order = st.radio('정렬 순서', ['오름차순', '내림차순'], horizontal=True, key='cut_sort_order')
+        ascending = True if sort_order == '오름차순' else False
+        if sort_col in df.columns:
+            disp_df = df.sort_values(by=sort_col, ascending=ascending)
+        else:
+            disp_df = df
+
         st.dataframe(
-            df.style.format({
+            disp_df.style.format({
                 "가로(cm)": "{:.1f}",
                 "세로(cm)": "{:.1f}",
                 "두께(mm)": "{:.3f}",
@@ -492,6 +606,27 @@ elif menu == "재단 재고 현황 보기":
         
         total_sheets = df['현재고(장)'].sum()
         st.info(f"📋 총 보유 재단 수량: {int(total_sheets)} 장")
+
+        # 편집 및 삭제 UI (재단)
+        with st.expander('재단 수정/삭제'):
+            edit_prod = st.selectbox('편집할 재단 선택', df['재단ID'].tolist(), key='select_cut_edit')
+            idx = df[df['재단ID'] == edit_prod].index[0]
+
+            new_company = st.text_input('업체명', value=df.loc[idx, '업체명'])
+            new_width = st.number_input('가로 (cm)', value=float(df.loc[idx, '가로(cm)']))
+            new_height = st.number_input('세로 (cm)', value=float(df.loc[idx, '세로(cm)']))
+            new_thickness = st.number_input('두께 (mm)', value=float(df.loc[idx, '두께(mm)']), format="%.3f")
+            new_stock = st.number_input('현재고 (장)', min_value=0, value=int(df.loc[idx, '현재고(장)']), step=1)
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button('저장', key='save_cut'):
+                    update_cut_item(edit_prod, 업체명=new_company, 가로_cm=new_width, 세로_cm=new_height, 두께_mm=new_thickness, 현재고_장=new_stock)
+                    st.success(f"[{edit_prod}] 재단 데이터가 업데이트되었습니다.")
+            with col_b:
+                if st.button('삭제', key='delete_cut'):
+                    delete_cut_item(edit_prod)
+                    st.success(f"[{edit_prod}] 재단 데이터가 삭제되었습니다.")
 
         # 재주문 임계값 알림
         alerts = []
