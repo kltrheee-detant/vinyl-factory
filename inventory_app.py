@@ -3,13 +3,17 @@ import pandas as pd
 import sqlite3
 import os
 from datetime import datetime, date
+import shutil
+import json
 
 # 데이터베이스 파일 경로
 DB_PATH = os.path.join(os.path.dirname(__file__), 'inventory.db')
+# 새로 추가: 현재 애플리케이션이 기대하는 DB 스키마 버전
+APP_DB_VERSION = "1.2"
 
 # ========== 데이터베이스 함수 ==========
 def init_db():
-    """데이터베이스 초기화 - 테이블 생성"""
+    """데이터베이스 초기화 - 테이블 생성 (기존 데이터는 건드리지 않음)"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
@@ -83,8 +87,139 @@ def init_db():
             threshold REAL
         )
     ''')
+
+    # 작업자(담당자) 테이블
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS managers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE
+        )
+    ''')
+
+    # 감사 로그 테이블 (일관된 컬럼명으로 하나만 생성)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_type TEXT,
+            item_id TEXT,
+            action TEXT,
+            before_json TEXT,
+            after_json TEXT,
+            actor TEXT,
+            timestamp TEXT
+        )
+    ''')
+
+    # DB 메타 (스키마 버전 관리)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS db_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+
     conn.commit()
     conn.close()
+
+# ========== DB 버전/마이그레이션 헬퍼 ==========
+def get_db_version():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT value FROM db_meta WHERE key = 'schema_version'")
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row is not None else None
+    except sqlite3.OperationalError:
+        conn.close()
+        return None
+
+def set_db_version(v):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES ('schema_version', ?)", (str(v),))
+    conn.commit()
+    conn.close()
+
+def backup_db():
+    """현재 DB 파일을 타임스탬프가 붙은 백업으로 복사합니다."""
+    if os.path.exists(DB_PATH):
+        bak_path = f"{DB_PATH}.bak.{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        shutil.copy2(DB_PATH, bak_path)
+        return bak_path
+    return None
+
+def column_exists(conn, table, column):
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = [r[1] for r in cur.fetchall()]
+    return column in cols
+
+# 각 마이그레이션은 idempotent 하게 작성 (존재하면 무시)
+def migration_to_1_1(conn):
+    # 예시: 향후 컬럼 추가 등의 non-destructive 변경을 여기에 둡니다.
+    pass
+
+def migration_to_1_2(conn):
+    # audit_logs에 before_json/after_json 컬럼이 없는 경우 추가하고,
+    # 구버전 컬럼(before/after)이 있으면 복사합니다(삭제하지 않음).
+    cur = conn.cursor()
+    if not column_exists(conn, 'audit_logs', 'before_json'):
+        cur.execute("ALTER TABLE audit_logs ADD COLUMN before_json TEXT")
+    if not column_exists(conn, 'audit_logs', 'after_json'):
+        cur.execute("ALTER TABLE audit_logs ADD COLUMN after_json TEXT")
+    # 구 컬럼이 존재한다면 데이터를 복사 (before -> before_json 등)
+    cur.execute("PRAGMA table_info(audit_logs)")
+    cols = [r[1] for r in cur.fetchall()]
+    if 'before' in cols and 'before_json' in cols:
+        cur.execute("UPDATE audit_logs SET before_json = before WHERE before_json IS NULL")
+    if 'after' in cols and 'after_json' in cols:
+        cur.execute("UPDATE audit_logs SET after_json = after WHERE after_json IS NULL")
+    conn.commit()
+
+MIGRATIONS = [
+    ("1.1", migration_to_1_1),
+    ("1.2", migration_to_1_2),
+]
+
+def check_and_migrate_db(auto_run=True):
+    """현재 DB 버전을 확인하고 필요 시 백업 후 마이그레이션 적용."""
+    cur_ver = get_db_version()
+    if cur_ver is None:
+        # 초기 DB의 경우 기본 버전을 1.0으로 설정
+        set_db_version("1.0")
+        cur_ver = "1.0"
+
+    if cur_ver == APP_DB_VERSION:
+        return
+
+    # 간단한 버전 비교 (문자열 기준, 단순 순서 가정)
+    # 필요한 마이그레이션만 적용
+    to_apply = [m for m in MIGRATIONS if cur_ver < m[0] <= APP_DB_VERSION]
+    if not to_apply:
+        set_db_version(APP_DB_VERSION)
+        return
+
+    if auto_run:
+        bak = backup_db()
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            for ver, func in to_apply:
+                func(conn)
+            set_db_version(APP_DB_VERSION)
+            conn.close()
+            # 스트림릿 환경에서 사용자에게 알림
+            try:
+                st.info(f"DB 마이그레이션 완료 (backup: {bak})")
+            except Exception:
+                pass
+        except Exception as e:
+            # 문제 발생시 정보 제공
+            try:
+                st.error(f"DB 마이그레이션 실패: {e} (backup: {bak})")
+            except Exception:
+                pass
+            raise
 
 def load_roll_inventory():
     """롤 재고 데이터 로드"""
@@ -151,6 +286,35 @@ def record_cut_transaction(item_id, delta, note=""):
     conn.close()
 
 
+# ========== 감사 로그 기록 ==========
+# (기존의 중복된 함수 정의 중복 제거: 아래 하나만 사용)
+def record_audit(item_type, item_id, action, before=None, after=None, actor=None):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    before_json = json.dumps(before, default=str) if before is not None else None
+    after_json = json.dumps(after, default=str) if after is not None else None
+    cursor.execute(
+        "INSERT INTO audit_logs (item_type, item_id, action, before_json, after_json, actor, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (item_type, item_id, action, before_json, after_json, actor, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_audit_logs(item_type, item_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT action, before_json, after_json, actor, timestamp FROM audit_logs WHERE item_type = ? AND item_id = ? ORDER BY id', (item_type, item_id))
+    rows = cursor.fetchall()
+    conn.close()
+    result = []
+    for action, before_json, after_json, actor, timestamp in rows:
+        before = json.loads(before_json) if before_json else None
+        after = json.loads(after_json) if after_json else None
+        result.append({'action': action, 'before': before, 'after': after, 'actor': actor, 'timestamp': timestamp})
+    return result
+
+
 def get_monthly_usage_cut(item_id, year=None, month=None):
     if year is None or month is None:
         now = datetime.now()
@@ -193,166 +357,47 @@ def get_reorder_level(item_type, item_id):
     conn.close()
     return float(row[0]) if row is not None else None
 
-def save_roll_inventory(df):
-    """롤 재고 데이터 저장"""
+
+def load_managers():
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    for _, row in df.iterrows():
-        # 재고는 음수일 수 없음
-        if float(row['현재고(롤)']) < 0:
-            conn.close()
-            raise ValueError("현재고(롤)은 음수일 수 없습니다")
-
-        cursor.execute('''
-            INSERT OR REPLACE INTO roll_inventory (제품ID, 두께_mm, 폭_cm, 롤길이_m, 현재고_롤, 최근업데이트)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (row['제품ID'], row['두께(mm)'], row['폭(cm)'], row['롤 길이(m)'], row['현재고(롤)'], row['최근업데이트']))
-    
-    conn.commit()
+    df = pd.read_sql_query('SELECT * FROM managers', conn)
     conn.close()
-
-
-def update_roll_item(product_id, **kwargs):
-    df = load_roll_inventory()
-    if product_id not in df['제품ID'].values:
-        raise KeyError(f"제품ID {product_id} 없음")
-    idx = df[df['제품ID'] == product_id].index[0]
-    for k, v in kwargs.items():
-        if k == '두께_mm' or k == '두께(mm)':
-            df.loc[idx, '두께(mm)'] = v
-        elif k == '폭_cm' or k == '폭(cm)':
-            df.loc[idx, '폭(cm)'] = v
-        elif k == '롤길이_m' or k == '롤 길이(m)':
-            df.loc[idx, '롤 길이(m)'] = v
-        elif k == '현재고_롤' or k == '현재고(롤)':
-            df.loc[idx, '현재고(롤)'] = v
-    df.loc[idx, '최근업데이트'] = datetime.now().strftime("%Y-%m-%d %H:%M")
-    save_roll_inventory(df)
-
-
-def delete_roll_item(product_id):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM roll_inventory WHERE 제품ID = ?', (product_id,))
-    conn.commit()
-    conn.close()
-
-def load_cut_inventory():
-    """재단 재고 데이터 로드"""
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT * FROM cut_inventory", conn)
-    conn.close()
-    
     if df.empty:
-        return pd.DataFrame(columns=['재단ID', '업체명', '가로(cm)', '세로(cm)', '두께(mm)', '현재고(장)', '최근업데이트'])
-    
-    df = df.rename(columns={
-        '가로_cm': '가로(cm)',
-        '세로_cm': '세로(cm)',
-        '두께_mm': '두께(mm)',
-        '현재고_장': '현재고(장)'
-    })
-    return df[['재단ID', '업체명', '가로(cm)', '세로(cm)', '두께(mm)', '현재고(장)', '최근업데이트']]
+        return []
+    return df['name'].tolist()
 
-def save_cut_inventory(df):
-    """재단 재고 데이터 저장"""
+
+def add_manager(name):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
-    for _, row in df.iterrows():
-        # 재고는 음수일 수 없음
-        if float(row['현재고(장)']) < 0:
-            conn.close()
-            raise ValueError("현재고(장)은 음수일 수 없습니다")
-
-        cursor.execute('''
-            INSERT OR REPLACE INTO cut_inventory (재단ID, 업체명, 가로_cm, 세로_cm, 두께_mm, 현재고_장, 최근업데이트)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (row['재단ID'], row['업체명'], row['가로(cm)'], row['세로(cm)'], row['두께(mm)'], row['현재고(장)'], row['최근업데이트']))
-    
+    cursor.execute('INSERT OR IGNORE INTO managers (name) VALUES (?)', (name,))
     conn.commit()
     conn.close()
 
 
-def update_cut_item(item_id, **kwargs):
-    df = load_cut_inventory()
-    if item_id not in df['재단ID'].values:
-        raise KeyError(f"재단ID {item_id} 없음")
-    idx = df[df['재단ID'] == item_id].index[0]
-    for k, v in kwargs.items():
-        # kwargs use DB column names (업체명, 가로_cm etc)
-        if k in ['업체명', '가로_cm', '세로_cm', '두께_mm', '현재고_장']:
-            # map to display columns if necessary
-            if k == '업체명':
-                df.loc[idx, '업체명'] = v
-            elif k == '가로_cm':
-                df.loc[idx, '가로(cm)'] = v
-            elif k == '세로_cm':
-                df.loc[idx, '세로(cm)'] = v
-            elif k == '두께_mm':
-                df.loc[idx, '두께(mm)'] = v
-            elif k == '현재고_장':
-                df.loc[idx, '현재고(장)'] = v
-    df.loc[idx, '최근업데이트'] = datetime.now().strftime("%Y-%m-%d %H:%M")
-    save_cut_inventory(df)
-
-
-def delete_cut_item(item_id):
+def delete_manager(name):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute('DELETE FROM cut_inventory WHERE 재단ID = ?', (item_id,))
+    cursor.execute('DELETE FROM managers WHERE name = ?', (name,))
     conn.commit()
     conn.close()
-
-def load_workflow():
-    """작업 플로우 데이터 로드"""
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT * FROM workflow", conn)
-    conn.close()
-    
-    if df.empty:
-        return pd.DataFrame(columns=['작업ID', '업체명', '제품규격', '수량', '단위', '담당자', '상태', '우선순위', '납기일', '메모', '등록일'])
-    
-    return df[['작업ID', '업체명', '제품규격', '수량', '단위', '담당자', '상태', '우선순위', '납기일', '메모', '등록일']]
-
-def save_workflow(df):
-    """작업 플로우 데이터 저장"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # 기존 데이터 삭제 후 새로 저장
-    cursor.execute("DELETE FROM workflow")
-    
-    for _, row in df.iterrows():
-        cursor.execute('''
-            INSERT INTO workflow (작업ID, 업체명, 제품규격, 수량, 단위, 담당자, 상태, 우선순위, 납기일, 메모, 등록일)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (row['작업ID'], row['업체명'], row['제품규격'], row['수량'], row['단위'], 
-              row['담당자'], row['상태'], row['우선순위'], row['납기일'], row['메모'], row['등록일']))
-    
-    conn.commit()
-    conn.close()
-
-
-def update_workflow_item(work_id, **kwargs):
-    df = load_workflow()
-    if work_id not in df['작업ID'].values:
-        raise KeyError(f"작업ID {work_id} 없음")
-    idx = df[df['작업ID'] == work_id].index[0]
-    for k, v in kwargs.items():
-        if k in df.columns:
-            df.loc[idx, k] = v
-    save_workflow(df)
 
 
 def delete_workflow_item(work_id):
     df = load_workflow()
+    if work_id in df['작업ID'].values:
+        before = df[df['작업ID'] == work_id].iloc[0].to_dict()
+    else:
+        before = None
     df = df[df['작업ID'] != work_id]
     save_workflow(df)
 
+    record_audit('workflow', work_id, 'delete', before=before, after=None)
+
 # 데이터베이스 초기화
 init_db()
+# 새로 추가: 시작 시 DB 버전 체크 및 필요한 경우 백업 + 마이그레이션 수행
+check_and_migrate_db()
 
 # 페이지 기본 설정
 st.set_page_config(page_title="비닐 공장 재고 현황판", layout="wide")
@@ -411,6 +456,7 @@ else:
     menu = st.sidebar.radio("작업을 선택하세요", [
         "작업 현황판 (칸반)",
         "신규 작업 등록",
+        "작업자 관리",
         "작업 상태 변경",
         "완료된 작업 보기"
     ])
@@ -463,12 +509,18 @@ if menu == "롤 재고 현황 보기":
             col_a, col_b = st.columns(2)
             with col_a:
                 if st.button('저장'):
-                    update_roll_item(edit_prod, 두께_mm=new_thickness, 폭_cm=new_width, 롤길이_m=new_length, 현재고_롤=new_stock)
-                    st.success(f"[{edit_prod}]가 업데이트되었습니다.")
+                    try:
+                        update_roll_item(edit_prod, 두께_mm=new_thickness, 폭_cm=new_width, 롤길이_m=new_length, 현재고_롤=new_stock)
+                        st.success(f"[{edit_prod}]가 업데이트되었습니다.")
+                    except ValueError as e:
+                        st.error(str(e))
             with col_b:
-                if st.button('삭제'):
+                confirm = st.checkbox('삭제 확인 (체크 후 삭제)', key='confirm_delete_roll')
+                if st.button('삭제') and confirm:
                     delete_roll_item(edit_prod)
                     st.success(f"[{edit_prod}]가 삭제되었습니다.")
+                elif st.button('삭제') and not confirm:
+                    st.error('삭제하려면 확인 체크박스를 선택하세요.')
 
         # 재주문 임계값 알림
         alerts = []
@@ -621,12 +673,18 @@ elif menu == "재단 재고 현황 보기":
             col_a, col_b = st.columns(2)
             with col_a:
                 if st.button('저장', key='save_cut'):
-                    update_cut_item(edit_prod, 업체명=new_company, 가로_cm=new_width, 세로_cm=new_height, 두께_mm=new_thickness, 현재고_장=new_stock)
-                    st.success(f"[{edit_prod}] 재단 데이터가 업데이트되었습니다.")
+                    try:
+                        update_cut_item(edit_prod, 업체명=new_company, 가로_cm=new_width, 세로_cm=new_height, 두께_mm=new_thickness, 현재고_장=new_stock)
+                        st.success(f"[{edit_prod}] 재단 데이터가 업데이트되었습니다.")
+                    except ValueError as e:
+                        st.error(str(e))
             with col_b:
-                if st.button('삭제', key='delete_cut'):
+                confirm = st.checkbox('삭제 확인 (체크 후 삭제)', key='confirm_delete_cut')
+                if st.button('삭제', key='delete_cut') and confirm:
                     delete_cut_item(edit_prod)
                     st.success(f"[{edit_prod}] 재단 데이터가 삭제되었습니다.")
+                elif st.button('삭제', key='delete_cut') and not confirm:
+                    st.error('삭제하려면 확인 체크박스를 선택하세요.')
 
         # 재주문 임계값 알림
         alerts = []
@@ -796,7 +854,16 @@ elif menu == "신규 작업 등록":
             quantity = st.number_input("수량", min_value=1, value=1)
         with col2:
             unit = st.selectbox("단위", ["장", "롤", "kg", "m"])
-            manager = st.text_input("담당자", placeholder="담당자 이름")
+            managers = load_managers()
+            manager_choice = None
+            if managers:
+                manager_choice = st.selectbox("담당자", managers + ["직접입력"], index=0)
+            else:
+                manager_choice = "직접입력"
+            if manager_choice == "직접입력":
+                manager = st.text_input("담당자", placeholder="담당자 이름")
+            else:
+                manager = manager_choice
             priority = st.selectbox("우선순위", PRIORITY_OPTIONS)
             due_date = st.date_input("납기일", value=date.today())
         
@@ -827,6 +894,34 @@ elif menu == "신규 작업 등록":
                 df = pd.concat([df, new_data], ignore_index=True)
                 save_workflow(df)
                 st.success(f"[{work_id}] 작업이 등록되었습니다.")
+
+# ========== 작업자 관리 ==========
+elif menu == "작업자 관리":
+    st.subheader("👥 작업자 관리")
+
+    mgrs = load_managers()
+    st.write("등록된 작업자:")
+    st.write(mgrs if mgrs else "(없음)")
+
+    with st.form("add_manager_form"):
+        new_mgr = st.text_input("작업자 이름", placeholder="이름 입력")
+        add_sub = st.form_submit_button("작업자 추가")
+        if add_sub:
+            if new_mgr.strip() == "":
+                st.error("작업자 이름을 입력해주세요.")
+            else:
+                add_manager(new_mgr.strip())
+                st.success(f"작업자 '{new_mgr.strip()}'가 추가되었습니다.")
+                st.experimental_rerun()
+
+    # 삭제
+    if mgrs:
+        to_delete = st.multiselect("삭제할 작업자 선택", mgrs)
+        if st.button("선택한 작업자 삭제", key='delete_mgr'):
+            for m in to_delete:
+                delete_manager(m)
+            st.success(f"{len(to_delete)}명 삭제되었습니다.")
+            st.experimental_rerun()
 
 elif menu == "작업 상태 변경":
     st.subheader("🔄 작업 상태 변경")
@@ -883,7 +978,15 @@ elif menu == "작업 상태 변경":
             new_spec = st.text_input('제품 규격', value=sel['제품규격'])
             new_qty = st.number_input('수량', min_value=1, value=int(sel['수량']))
             new_unit = st.selectbox('단위', ['장', '롤', 'kg', 'm'], index=['장','롤','kg','m'].index(sel['단위']) if sel['단위'] in ['장','롤','kg','m'] else 0)
-            new_manager = st.text_input('담당자', value=sel['담당자'])
+            managers = load_managers()
+            if managers:
+                manager_choice = st.selectbox('담당자', managers + ['직접입력'], index=managers.index(sel['담당자']) if sel['담당자'] in managers else len(managers))
+                if manager_choice == '직접입력':
+                    new_manager = st.text_input('담당자', value=sel['담당자'])
+                else:
+                    new_manager = manager_choice
+            else:
+                new_manager = st.text_input('담당자', value=sel['담당자'])
             new_priority = st.selectbox('우선순위', PRIORITY_OPTIONS, index=PRIORITY_OPTIONS.index(sel['우선순위']) if sel['우선순위'] in PRIORITY_OPTIONS else 2)
             new_due = st.date_input('납기일', value=datetime.strptime(sel['납기일'], "%Y-%m-%d").date() if sel['납기일'] else date.today())
             new_memo = st.text_area('메모', value=sel['메모'])
@@ -891,14 +994,20 @@ elif menu == "작업 상태 변경":
             col_a, col_b = st.columns(2)
             with col_a:
                 if st.button('저장(작업 변경)'):
-                    update_workflow_item(selected_id, 업체명=new_company, 제품규격=new_spec, 수량=new_qty, 단위=new_unit, 담당자=new_manager, 우선순위=new_priority, 납기일=new_due.strftime("%Y-%m-%d"), 메모=new_memo)
-                    st.success(f"[{selected_id}] 작업이 업데이트되었습니다.")
-                    st.rerun()
+                    try:
+                        update_workflow_item(selected_id, 업체명=new_company, 제품규격=new_spec, 수량=new_qty, 단위=new_unit, 담당자=new_manager, 우선순위=new_priority, 납기일=new_due.strftime("%Y-%m-%d"), 메모=new_memo)
+                        st.success(f"[{selected_id}] 작업이 업데이트되었습니다.")
+                        st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
             with col_b:
-                if st.button('삭제(작업 삭제)'):
+                confirm = st.checkbox('삭제 확인 (체크 후 삭제)', key='confirm_delete_work')
+                if st.button('삭제(작업 삭제)') and confirm:
                     delete_workflow_item(selected_id)
                     st.success(f"[{selected_id}] 작업이 삭제되었습니다.")
                     st.rerun()
+                elif st.button('삭제(작업 삭제)') and not confirm:
+                    st.error('삭제하려면 확인 체크박스를 선택하세요.')
 
 elif menu == "완료된 작업 보기":
     st.subheader("✅ 완료된 작업 목록")
