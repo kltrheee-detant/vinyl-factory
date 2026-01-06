@@ -1,4 +1,6 @@
 import streamlit as st
+import streamlit.components.v1 as components  # 모바일 화면 감지용(간단 JS 삽입)
+import base64
 import pandas as pd
 import sqlite3
 import os
@@ -384,31 +386,256 @@ def delete_manager(name):
 
 
 def delete_workflow_item(work_id):
-    df = load_workflow()
-    if work_id in df['작업ID'].values:
-        before = df[df['작업ID'] == work_id].iloc[0].to_dict()
-    else:
-        before = None
-    df = df[df['작업ID'] != work_id]
-    save_workflow(df)
-
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT 작업ID, 업체명, 제품규격, 수량, 단위, 담당자, 상태, 우선순위, 납기일, 메모, 등록일 FROM workflow WHERE 작업ID = ?", (work_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        raise ValueError("존재하지 않는 작업ID입니다.")
+    before = dict(zip(['작업ID','업체명','제품규격','수량','단위','담당자','상태','우선순위','납기일','메모','등록일'], row))
+    cur.execute("DELETE FROM workflow WHERE 작업ID = ?", (work_id,))
+    conn.commit()
+    conn.close()
     record_audit('workflow', work_id, 'delete', before=before, after=None)
+
+def load_cut_inventory():
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query("SELECT * FROM cut_inventory", conn)
+    conn.close()
+    if df.empty:
+        return pd.DataFrame(columns=['재단ID', '업체명', '가로(cm)', '세로(cm)', '두께(mm)', '현재고(장)', '최근업데이트'])
+    df = df.rename(columns={
+        '가로_cm': '가로(cm)',
+        '세로_cm': '세로(cm)',
+        '두께_mm': '두께(mm)',
+        '현재고_장': '현재고(장)'
+    })
+    return df[['재단ID', '업체명', '가로(cm)', '세로(cm)', '두께(mm)', '현재고(장)', '최근업데이트']]
+
+
+def save_roll_inventory(df):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    for _, row in df.iterrows():
+        stock = int(row['현재고(롤)'])
+        if stock < 0:
+            conn.close()
+            raise ValueError("재고 수량은 음수가 될 수 없습니다.")
+        cur.execute('''
+            INSERT OR REPLACE INTO roll_inventory (제품ID, 두께_mm, 폭_cm, 롤길이_m, 현재고_롤, 최근업데이트)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (row['제품ID'], float(row['두께(mm)']), float(row['폭(cm)']), float(row['롤 길이(m)']), stock, row.get('최근업데이트')))
+    conn.commit()
+    conn.close()
+
+
+def save_cut_inventory(df):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    for _, row in df.iterrows():
+        cur.execute('''
+            INSERT OR REPLACE INTO cut_inventory (재단ID, 업체명, 가로_cm, 세로_cm, 두께_mm, 현재고_장, 최근업데이트)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (row['재단ID'], row['업체명'], float(row['가로(cm)']), float(row['세로(cm)']), float(row['두께(mm)']), int(row['현재고(장)']), row.get('최근업데이트')))
+    conn.commit()
+    conn.close()
+
+
+def load_workflow():
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query("SELECT * FROM workflow", conn)
+    conn.close()
+    if df.empty:
+        return pd.DataFrame(columns=['작업ID','업체명','제품규격','수량','단위','담당자','상태','우선순위','납기일','메모','등록일'])
+    return df[['작업ID','업체명','제품규격','수량','단위','담당자','상태','우선순위','납기일','메모','등록일']]
+
+
+def save_workflow(df):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    for _, row in df.iterrows():
+        # 중복 체크
+        cur.execute("SELECT COUNT(*) FROM workflow WHERE 작업ID = ?", (row['작업ID'],))
+        if cur.fetchone()[0] > 0:
+            conn.close()
+            raise sqlite3.IntegrityError("UNIQUE constraint failed: workflow.작업ID")
+        cur.execute('''
+            INSERT INTO workflow (작업ID, 업체명, 제품규격, 수량, 단위, 담당자, 상태, 우선순위, 납기일, 메모, 등록일)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            row['작업ID'], row['업체명'], row['제품규격'], int(row['수량']), row['단위'], row['담당자'],
+            row['상태'], row['우선순위'], row['납기일'], row['메모'], row.get('등록일')
+        ))
+    conn.commit()
+    conn.close()
+
+
+def update_roll_item(item_id, **kwargs):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT 제품ID, 두께_mm, 폭_cm, 롤길이_m, 현재고_롤, 최근업데이트 FROM roll_inventory WHERE 제품ID = ?", (item_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        raise ValueError("존재하지 않는 제품ID입니다.")
+    before = dict(zip(['제품ID','두께(mm)','폭(cm)','롤 길이(m)','현재고(롤)','최근업데이트'], [row[0], row[1], row[2], row[3], row[4], row[5]]))
+    fields = {}
+    if '두께_mm' in kwargs or '두께(mm)' in kwargs:
+        fields['두께_mm'] = float(kwargs.get('두께_mm', kwargs.get('두께(mm)')))
+    if '폭_cm' in kwargs or '폭(cm)' in kwargs:
+        fields['폭_cm'] = float(kwargs.get('폭_cm', kwargs.get('폭(cm)')))
+    if '롤길이_m' in kwargs or '롤 길이(m)' in kwargs:
+        fields['롤길이_m'] = float(kwargs.get('롤길이_m', kwargs.get('롤 길이(m)')))
+    if '현재고_롤' in kwargs or '현재고(롤)' in kwargs:
+        new_stock = int(kwargs.get('현재고_롤', kwargs.get('현재고(롤)')))
+        if new_stock < 0:
+            conn.close()
+            raise ValueError("재고 수량은 음수가 될 수 없습니다.")
+        fields['현재고_롤'] = new_stock
+    if '최근업데이트' in kwargs:
+        fields['최근업데이트'] = kwargs['최근업데이트']
+    if fields:
+        set_clause = ", ".join(f"{k}=?" for k in fields.keys())
+        params = list(fields.values()) + [item_id]
+        cur.execute(f"UPDATE roll_inventory SET {set_clause} WHERE 제품ID = ?", params)
+    conn.commit()
+    cur.execute("SELECT 제품ID, 두께_mm, 폭_cm, 롤길이_m, 현재고_롤, 최근업데이트 FROM roll_inventory WHERE 제품ID = ?", (item_id,))
+    row2 = cur.fetchone()
+    after = dict(zip(['제품ID','두께(mm)','폭(cm)','롤 길이(m)','현재고(롤)','최근업데이트'], [row2[0], row2[1], row2[2], row2[3], row2[4], row2[5]]))
+    conn.close()
+    record_audit('roll', item_id, 'update', before=before, after=after)
+
+
+def delete_roll_item(item_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT 제품ID, 두께_mm, 폭_cm, 롤길이_m, 현재고_롤, 최근업데이트 FROM roll_inventory WHERE 제품ID = ?", (item_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        raise ValueError("존재하지 않는 제품ID입니다.")
+    before = dict(zip(['제품ID','두께(mm)','폭(cm)','롤 길이(m)','현재고(롤)','최근업데이트'], [row[0], row[1], row[2], row[3], row[4], row[5]]))
+    cur.execute("DELETE FROM roll_inventory WHERE 제품ID = ?", (item_id,))
+    conn.commit()
+    conn.close()
+    record_audit('roll', item_id, 'delete', before=before, after=None)
+
+
+def update_cut_item(item_id, **kwargs):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT 재단ID, 업체명, 가로_cm, 세로_cm, 두께_mm, 현재고_장, 최근업데이트 FROM cut_inventory WHERE 재단ID = ?", (item_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        raise ValueError("존재하지 않는 재단ID입니다.")
+    before = dict(zip(['재단ID','업체명','가로(cm)','세로(cm)','두께(mm)','현재고(장)','최근업데이트'], [row[0],row[1],row[2],row[3],row[4],row[5],row[6]]))
+    fields = {}
+    if '업체명' in kwargs:
+        fields['업체명'] = kwargs['업체명']
+    if '가로_cm' in kwargs or '가로(cm)' in kwargs:
+        fields['가로_cm'] = float(kwargs.get('가로_cm', kwargs.get('가로(cm)')))
+    if '세로_cm' in kwargs or '세로(cm)' in kwargs:
+        fields['세로_cm'] = float(kwargs.get('세로_cm', kwargs.get('세로(cm)')))
+    if '두께_mm' in kwargs or '두께(mm)' in kwargs:
+        fields['두께_mm'] = float(kwargs.get('두께_mm', kwargs.get('두께(mm)')))
+    if '현재고_장' in kwargs or '현재고(장)' in kwargs:
+        fields['현재고_장'] = int(kwargs.get('현재고_장', kwargs.get('현재고(장)')))
+    if '최근업데이트' in kwargs:
+        fields['최근업데이트'] = kwargs['최근업데이트']
+    if fields:
+        set_clause = ", ".join(f"{k}=?" for k in fields.keys())
+        params = list(fields.values()) + [item_id]
+        cur.execute(f"UPDATE cut_inventory SET {set_clause} WHERE 재단ID = ?", params)
+    conn.commit()
+    cur.execute("SELECT 재단ID, 업체명, 가로_cm, 세로_cm, 두께_mm, 현재고_장, 최근업데이트 FROM cut_inventory WHERE 재단ID = ?", (item_id,))
+    row2 = cur.fetchone()
+    after = dict(zip(['재단ID','업체명','가로(cm)','세로(cm)','두께(mm)','현재고(장)','최근업데이트'], [row2[0],row2[1],row2[2],row2[3],row2[4],row2[5],row2[6]]))
+    conn.close()
+    record_audit('cut', item_id, 'update', before=before, after=after)
+
+
+def delete_cut_item(item_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT 재단ID, 업체명, 가로_cm, 세로_cm, 두께_mm, 현재고_장, 최근업데이트 FROM cut_inventory WHERE 재단ID = ?", (item_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        raise ValueError("존재하지 않는 재단ID입니다.")
+    before = dict(zip(['재단ID','업체명','가로(cm)','세로(cm)','두께(mm)','현재고(장)','최근업데이트'], [row[0],row[1],row[2],row[3],row[4],row[5],row[6]]))
+    cur.execute("DELETE FROM cut_inventory WHERE 재단ID = ?", (item_id,))
+    conn.commit()
+    conn.close()
+    record_audit('cut', item_id, 'delete', before=before, after=None)
+
+
+def update_workflow_item(work_id, **kwargs):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT 작업ID, 업체명, 제품규격, 수량, 단위, 담당자, 상태, 우선순위, 납기일, 메모, 등록일 FROM workflow WHERE 작업ID = ?", (work_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        raise ValueError("존재하지 않는 작업ID입니다.")
+    before = dict(zip(['작업ID','업체명','제품규격','수량','단위','담당자','상태','우선순위','납기일','메모','등록일'], row))
+    fields = {}
+    allowed = ['업체명','제품규격','수량','단위','담당자','상태','우선순위','납기일','메모','등록일']
+    for k in allowed:
+        if k in kwargs:
+            fields[k] = kwargs[k]
+    if fields:
+        set_clause = ", ".join(f"{k}=?" for k in fields.keys())
+        params = list(fields.values()) + [work_id]
+        cur.execute(f"UPDATE workflow SET {set_clause} WHERE 작업ID = ?", params)
+    conn.commit()
+    cur.execute("SELECT 작업ID, 업체명, 제품규격, 수량, 단위, 담당자, 상태, 우선순위, 납기일, 메모, 등록일 FROM workflow WHERE 작업ID = ?", (work_id,))
+    row2 = cur.fetchone()
+    after = dict(zip(['작업ID','업체명','제품규격','수량','단위','담당자','상태','우선순위','납기일','메모','등록일'], row2))
+    conn.close()
+    record_audit('workflow', work_id, 'update', before=before, after=after)
 
 # 데이터베이스 초기화
 init_db()
 # 새로 추가: 시작 시 DB 버전 체크 및 필요한 경우 백업 + 마이그레이션 수행
 check_and_migrate_db()
 
-# 페이지 기본 설정
-st.set_page_config(page_title="비닐 공장 재고 현황판", layout="wide")
+# 페이지 기본 설정 (페이지 아이콘 추가, 모바일 파비콘/홈아이콘은 외부 호스팅 권장)
+st.set_page_config(page_title="비닐 공장 재고 현황판", layout="wide", page_icon="🏭")
 
-# 스타일링
+# 모바일 대응 메타 및 CSS (간단한 미디어쿼리로 버튼/표/패딩 최적화)
+st.markdown('<meta name="viewport" content="width=device-width, initial-scale=1">', unsafe_allow_html=True)
 st.markdown("""
-    <style>
-        .big-font { font-size: 20px !important; font-weight: bold; }
-        .stDataFrame { width: 100%; }
-    </style>
+<style>
+  /* 전역 스타일(기존 .big-font 유지) */
+  .big-font { font-size: 20px !important; font-weight: bold; }
+  .stDataFrame { width: 100%; }
+
+  /* 모바일 전용 최적화 */
+  @media (max-width: 600px) {
+    /* 컨테이너 여백 축소 */
+    .block-container { padding-left: 8px !important; padding-right: 8px !important; }
+    /* 데이터프레임 폰트 축소 */
+    .stDataFrame table td, .stDataFrame table th { font-size: 12px !important; }
+    /* 버튼 크기 키우기(터치 편의) */
+    .stButton>button, button[kind="primary"] { padding: 12px 16px !important; font-size: 16px !important; }
+    /* 캡션/메모 등 축약 */
+    .big-font { font-size: 16px !important; }
+    /* 열 레이아웃이 좁을 때 세로로 쌓이도록 강제 (Streamlit 내부 클래스는 변경될 수 있음) */
+    .css-1lcbmhc, .css-1d391kg { flex-direction: column !important; }
+  }
+</style>
 """, unsafe_allow_html=True)
+
+# 간단한 JS로 화면 너비가 작은 경우 body에 클래스 추가 (확인/추가 로직에 활용 가능)
+components.html("""
+<script>
+  if (window && window.innerWidth && window.innerWidth < 600) {
+    document.body.classList.add('is-mobile');
+  }
+</script>
+""", height=0)
 
 # 제목
 st.title("🏭 유한화학 재고 현황판")
@@ -1040,3 +1267,58 @@ elif menu == "완료된 작업 보기":
 # 하단 푸터
 st.markdown("---")
 st.markdown("© 2026 유한화학 재고 시스템")
+
+# ========== PWA 아이콘/manifest 연결 ==========
+# static 폴더에 icon-192.png / icon-512.png 를 넣으면 자동으로 파비콘/애플 아이콘 및 manifest에 사용됩니다.
+STATIC_DIR = os.path.join(os.path.dirname(__file__), 'static')
+
+def _load_icon_base64(name):
+    p = os.path.join(STATIC_DIR, name)
+    if os.path.exists(p):
+        with open(p, 'rb') as f:
+            return base64.b64encode(f.read()).decode('ascii')
+    return None
+
+_icon_192 = _load_icon_base64('icon-192.png')
+_icon_512 = _load_icon_base64('icon-512.png')
+
+if _icon_192:
+    st.markdown(f'<link rel="icon" href="data:image/png;base64,{_icon_192}">', unsafe_allow_html=True)
+    st.markdown(f'<link rel="apple-touch-icon" sizes="192x192" href="data:image/png;base64,{_icon_192}">', unsafe_allow_html=True)
+
+# manifest를 클라이언트에서 Blob으로 생성하여 연결 (data: 또는 blob: 지원 문제 회피)
+manifest_obj = {
+    "name": "유한화학 재고",
+    "short_name": "재고",
+    "start_url": ".",
+    "display": "standalone",
+    "theme_color": "#ffffff",
+    "background_color": "#ffffff",
+}
+icons = []
+if _icon_192:
+    icons.append({"src": f"data:image/png;base64,{_icon_192}", "sizes": "192x192", "type": "image/png"})
+if _icon_512:
+    icons.append({"src": f"data:image/png;base64,{_icon_512}", "sizes": "512x512", "type": "image/png"})
+if icons:
+    manifest_obj["icons"] = icons
+
+# 클라이언트에서 manifest Blob 생성 및 link[rel="manifest"] 연결
+components.html(f"""
+<script>
+  const manifest = {json.dumps(manifest_obj)};
+  const blob = new Blob([JSON.stringify(manifest)], {{type: 'application/json'}});
+  const url = URL.createObjectURL(blob);
+  let link = document.querySelector('link[rel="manifest"]');
+  if (!link) {{
+    link = document.createElement('link');
+    link.rel = 'manifest';
+    document.head.appendChild(link);
+  }}
+  link.href = url;
+</script>
+""", height=0)
+
+# 안내: 아이콘이 없는 경우 사용자가 static/에 파일을 넣도록 알림
+if not (_icon_192 and _icon_512):
+    st.info("모바일 홈화면 아이콘을 사용하려면 `./static/icon-192.png` 및 `./static/icon-512.png` 파일을 추가하세요. (권장: 192×192, 512×512 PNG)")

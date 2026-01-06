@@ -30,9 +30,9 @@ def test_audit_on_workflow_update_and_delete(tmp_path):
     app.save_workflow(df)
 
     app.update_workflow_item('W-AUD', 업체명='Client2', 수량=5)
-    logs = app.load_audit_logs('workflow', 'W-AUD')
-    assert any(log[3] == 'update' for log in logs)
+    logs = app.get_audit_logs('workflow', 'W-AUD')
+    assert any(log['action'] == 'update' for log in logs)
 
     app.delete_workflow_item('W-AUD')
-    logs2 = app.load_audit_logs('workflow', 'W-AUD')
-    assert any(log[3] == 'delete' for log in logs2)
+    logs2 = app.get_audit_logs('workflow', 'W-AUD')
+    assert any(log['action'] == 'delete' for log in logs2)
