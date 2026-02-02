@@ -1,0 +1,20 @@
+.venv/
+inventory.db
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+.env
+.vscode/
+*.swp
+
+# Firebase - 중요: 절대 커밋하지 마세요!
+firebase_credentials.json
+*-firebase-adminsdk-*.json
+
+# Streamlit
+.streamlit/
+
+# Logs
+*.log
