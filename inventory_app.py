@@ -11,7 +11,8 @@ from firebase_db import (
     load_cut_inventory, save_cut_inventory, update_cut_item, delete_cut_item,
     record_cut_transaction, get_monthly_usage_cut,
     load_workflow, save_workflow, update_workflow_item, delete_workflow_item,
-    set_reorder_level, get_reorder_level
+    set_reorder_level, get_reorder_level,
+    load_raw_materials, save_raw_materials, log_raw_material_transaction
 )
 from firebase_config import verify_company_code, get_firestore_client
 
@@ -481,13 +482,7 @@ elif menu == "신규 재단 규격 등록":
 elif menu == "원료 재고 현황":
     st.subheader("🛢️ 원료 재고 목록")
     
-    # 원료 데이터 로드 (함수 필요)
-    try:
-        df = load_raw_materials()
-    except NameError:
-        # 함수가 아직 로드되지 않았을 경우를 대비
-        from firebase_db import load_raw_materials, save_raw_materials, log_raw_material_transaction
-        df = load_raw_materials()
+    df = load_raw_materials()
 
     if df.empty:
         st.info("등록된 원료가 없습니다. '신규 원료 등록' 메뉴에서 추가해주세요.")
@@ -515,11 +510,7 @@ elif menu == "원료 재고 현황":
 elif menu == "원료 입/출고":
     st.subheader("📝 원료 입고 및 사용 등록")
     
-    try:
-        df = load_raw_materials()
-    except:
-        from firebase_db import load_raw_materials, save_raw_materials, log_raw_material_transaction
-        df = load_raw_materials()
+    df = load_raw_materials()
     
     if df.empty:
         st.warning("등록된 원료가 없습니다.")
@@ -579,11 +570,7 @@ elif menu == "신규 원료 등록":
             if not name or not grade:
                 st.error("품명과 Grade는 필수입니다.")
             else:
-                try:
-                    df = load_raw_materials()
-                except:
-                    from firebase_db import load_raw_materials, save_raw_materials
-                    df = load_raw_materials()
+                df = load_raw_materials()
                 
                 # 중복 체크
                 duplicate = df[(df['품명'] == name) & (df['Grade'] == grade)]
