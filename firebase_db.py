@@ -453,3 +453,81 @@ def delete_workflow_item(work_id):
         raise Exception("Firebase 연결 실패")
     
     db.collection('workflow').document(str(work_id)).delete()
+
+
+# --------------------------------------------------------------------------------
+# 원료 재고 관리 함수
+# --------------------------------------------------------------------------------
+
+def load_raw_materials():
+    """원료 재고 데이터 로드"""
+    db = get_firestore_client()
+    
+    if db is None:
+        return pd.DataFrame(columns=['품명', 'Grade', '현재고_kg', '입고일', '비고'])
+    
+    try:
+        docs = db.collection('raw_materials').stream()
+        data = []
+        
+        for doc in docs:
+            d = doc.to_dict()
+            data.append({
+                '품명': d.get('품명', ''),
+                'Grade': d.get('Grade', ''),
+                '현재고_kg': d.get('현재고_kg', 0),
+                '입고일': d.get('입고일', ''),
+                '비고': d.get('비고', '')
+            })
+        
+        if not data:
+            return pd.DataFrame(columns=['품명', 'Grade', '현재고_kg', '입고일', '비고'])
+        
+        return pd.DataFrame(data)
+        
+    except Exception as e:
+        print(f"원료 재고 로드 오류: {e}")
+        return pd.DataFrame(columns=['품명', 'Grade', '현재고_kg', '입고일', '비고'])
+
+
+def save_raw_materials(df):
+    """원료 재고 데이터 저장"""
+    db = get_firestore_client()
+    
+    if db is None:
+        raise Exception("Firebase 연결 실패")
+    
+    batch = db.batch()
+    
+    for _, row in df.iterrows():
+        # 문서 ID는 '품명_Grade' 조합으로 생성하여 유니크하게 관리
+        doc_id = f"{row['품명']}_{row['Grade']}"
+        doc_ref = db.collection('raw_materials').document(doc_id)
+        
+        batch.set(doc_ref, {
+            '품명': row['품명'],
+            'Grade': row['Grade'],
+            '현재고_kg': float(row['현재고_kg']),
+            '입고일': str(row['입고일']),
+            '비고': str(row['비고'])
+        })
+    
+    batch.commit()
+
+
+def log_raw_material_transaction(product_name, grade, change_amount, transaction_type, date):
+    """원료 입출고 기록"""
+    db = get_firestore_client()
+    if db is None: return
+
+    try:
+        db.collection('raw_material_transactions').add({
+            '품명': product_name,
+            'Grade': grade,
+            '수량변경': float(change_amount),
+            '구분': transaction_type,  # '입고', '출고', '수정'
+            '날짜': date,
+            'timestamp': firestore.SERVER_TIMESTAMP
+        })
+    except Exception as e:
+        print(f"로그 저장 오류: {e}")

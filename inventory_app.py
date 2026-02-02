@@ -133,7 +133,7 @@ PRIORITY_OPTIONS = ['긴급', '높음', '보통', '낮음']
 # 사이드바: 작업 선택
 st.sidebar.header("🛠 작업 메뉴")
 
-menu_category = st.sidebar.selectbox("카테고리 선택", ["📦 롤 재고 관리", "✂️ 재단 재고 관리", "📋 작업 플로우 (TODO)"])
+menu_category = st.sidebar.selectbox("카테고리 선택", ["📦 롤 재고 관리", "✂️ 재단 재고 관리", "🛢️ 원료 재고 관리", "📋 작업 플로우 (TODO)"])
 
 if menu_category == "📦 롤 재고 관리":
     menu = st.sidebar.radio("작업을 선택하세요", [
@@ -146,6 +146,12 @@ elif menu_category == "✂️ 재단 재고 관리":
         "재단 재고 현황 보기",
         "재단 입/출고 입력",
         "신규 재단 규격 등록"
+    ])
+elif menu_category == "🛢️ 원료 재고 관리":
+    menu = st.sidebar.radio("작업을 선택하세요", [
+        "원료 재고 현황",
+        "원료 입/출고",
+        "신규 원료 등록"
     ])
 else:
     menu = st.sidebar.radio("작업을 선택하세요", [
@@ -470,6 +476,131 @@ elif menu == "신규 재단 규격 등록":
                 df = pd.concat([df, new_data], ignore_index=True)
                 save_cut_inventory(df)
                 st.success(f"[{new_id}] {company} 재단 규격이 등록되었습니다.")
+
+# ========== 원료 재고 관리 ==========
+elif menu == "원료 재고 현황":
+    st.subheader("🛢️ 원료 재고 목록")
+    
+    # 원료 데이터 로드 (함수 필요)
+    try:
+        df = load_raw_materials()
+    except NameError:
+        # 함수가 아직 로드되지 않았을 경우를 대비
+        from firebase_db import load_raw_materials, save_raw_materials, log_raw_material_transaction
+        df = load_raw_materials()
+
+    if df.empty:
+        st.info("등록된 원료가 없습니다. '신규 원료 등록' 메뉴에서 추가해주세요.")
+    else:
+        # 정렬
+        sort_cols = ['품명', 'Grade', '현재고_kg', '입고일']
+        sort_col = st.selectbox('정렬 기준', sort_cols, index=0, key='raw_sort')
+        sort_order = st.radio('정렬 순서', ['오름차순', '내림차순'], horizontal=True, key='raw_order')
+        ascending = True if sort_order == '오름차순' else False
+        
+        if sort_col in df.columns:
+            df = df.sort_values(by=sort_col, ascending=ascending)
+
+        st.dataframe(
+            df.style.format({
+                "현재고_kg": "{:.1f}"
+            }),
+            use_container_width=True,
+            height=400
+        )
+        
+        total_kg = df['현재고_kg'].sum()
+        st.info(f"📋 총 원료 보유량: {total_kg:,.1f} kg")
+
+elif menu == "원료 입/출고":
+    st.subheader("📝 원료 입고 및 사용 등록")
+    
+    try:
+        df = load_raw_materials()
+    except:
+        from firebase_db import load_raw_materials, save_raw_materials, log_raw_material_transaction
+        df = load_raw_materials()
+    
+    if df.empty:
+        st.warning("등록된 원료가 없습니다.")
+    else:
+        # 선택박스 표시용 리스트
+        df['label'] = df.apply(lambda x: f"[{x['품명']}] {x['Grade']} (현재: {x['현재고_kg']}kg)", axis=1)
+        selected_str = st.selectbox("원료를 선택하세요", df['label'].tolist())
+        
+        # 선택된 원료 찾기
+        selected_row = df[df['label'] == selected_str].iloc[0]
+        selected_idx = df[df['label'] == selected_str].index[0]
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            input_type = st.radio("구분", ["입고 (+)", "사용 (-)"], horizontal=True, key='raw_type')
+        with col2:
+            qty = st.number_input("수량 (kg)", min_value=1.0, step=10.0, key='raw_qty')
+
+        if st.button("재고 반영", key='raw_submit'):
+            current_qty = float(selected_row['현재고_kg'])
+            
+            if input_type == "입고 (+)":
+                new_qty = current_qty + qty
+                df.at[selected_idx, '현재고_kg'] = new_qty
+                # 로그 저장
+                log_raw_material_transaction(selected_row['품명'], selected_row['Grade'], qty, '입고', datetime.now().strftime("%Y-%m-%d"))
+                save_raw_materials(df)
+                st.success(f"입고 완료! 현재고: {new_qty} kg")
+            else:
+                if current_qty < qty:
+                    st.error("재고가 부족합니다!")
+                else:
+                    new_qty = current_qty - qty
+                    df.at[selected_idx, '현재고_kg'] = new_qty
+                    # 로그 저장
+                    log_raw_material_transaction(selected_row['품명'], selected_row['Grade'], -qty, '출고', datetime.now().strftime("%Y-%m-%d"))
+                    save_raw_materials(df)
+                    st.success(f"사용 등록 완료! 현재고: {new_qty} kg")
+
+elif menu == "신규 원료 등록":
+    st.subheader("✨ 신규 원료 등록")
+    
+    with st.form("new_raw_material"):
+        col1, col2 = st.columns(2)
+        with col1:
+            name = st.text_input("품명 (예: LDPE)")
+            grade = st.text_input("Grade (예: 530)")
+        with col2:
+            initial_stock = st.number_input("초기 재고 (kg)", min_value=0.0, step=10.0)
+            in_date = st.date_input("입고일", value=date.today())
+            
+        note = st.text_area("비고")
+        
+        submitted = st.form_submit_button("등록")
+        
+        if submitted:
+            if not name or not grade:
+                st.error("품명과 Grade는 필수입니다.")
+            else:
+                try:
+                    df = load_raw_materials()
+                except:
+                    from firebase_db import load_raw_materials, save_raw_materials
+                    df = load_raw_materials()
+                
+                # 중복 체크
+                duplicate = df[(df['품명'] == name) & (df['Grade'] == grade)]
+                if not duplicate.empty:
+                    st.error("이미 등록된 품명/Grade 입니다.")
+                else:
+                    new_data = pd.DataFrame([{
+                        '품명': name,
+                        'Grade': grade,
+                        '현재고_kg': initial_stock,
+                        '입고일': in_date.strftime("%Y-%m-%d"),
+                        '비고': note
+                    }])
+                    df = pd.concat([df, new_data], ignore_index=True)
+                    save_raw_materials(df)
+                    st.success(f"[{name} {grade}] 등록되었습니다.")
+
 
 # ========== 작업 플로우 (TODO) ==========
 elif menu == "작업 현황판 (칸반)":
