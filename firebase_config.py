@@ -23,7 +23,14 @@ def initialize_firebase():
         from firebase_admin import credentials, firestore
         
         # Streamlit Cloud secrets에서 설정 로드 시도
-        if hasattr(st, 'secrets') and 'firebase' in st.secrets:
+        use_secrets = False
+        try:
+            if hasattr(st, 'secrets') and 'firebase' in st.secrets:
+                use_secrets = True
+        except Exception:
+            pass
+        
+        if use_secrets:
             # Streamlit Cloud 배포 환경
             cred_dict = dict(st.secrets['firebase'])
             cred = credentials.Certificate(cred_dict)
